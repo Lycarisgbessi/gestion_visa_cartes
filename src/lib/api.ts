@@ -1,14 +1,13 @@
-import { supabase } from './supabase';
+import { neon } from '@neondatabase/serverless';
+
+const sql = neon('postgresql://neondb_owner:npg_MsVK3A6JhwUn@ep-solitary-credit-ax2c9uwj-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require');
 
 export async function fetchApi(endpoint: string, options?: RequestInit) {
   const method = options?.method || 'GET';
   const body = options?.body ? JSON.parse(options.body as string) : null;
-
-  // Helper to parse endpoint
   const match = (pattern: RegExp) => endpoint.match(pattern);
 
   try {
-    // --- Stats ---
     if (endpoint.startsWith('/stats') && method === 'GET') {
       const urlParams = new URLSearchParams(endpoint.split('?')[1]);
       const period = urlParams.get('period') || 'all';
@@ -25,61 +24,39 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
         startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString();
       }
 
-      // 1. Snapshot stats (Stock & Debt)
-      const [{ count: totalStock }, { count: withPartners }, { data: partners }] = await Promise.all([
-        supabase.from('cards').select('*', { count: 'exact', head: true }).eq('status', 'in_stock'),
-        supabase.from('cards').select('*', { count: 'exact', head: true }).eq('status', 'with_partner'),
-        supabase.from('partners').select('totalDebt')
-      ]);
+      const totalStockRes = await sql`SELECT COUNT(*) as count FROM cards WHERE status = 'in_stock'`;
+      const withPartnersRes = await sql`SELECT COUNT(*) as count FROM cards WHERE status = 'with_partner'`;
+      const partnersRes = await sql`SELECT "totalDebt" FROM partners`;
+      
+      const salesTx = await sql`SELECT quantity, "cardIds" FROM transactions WHERE type IN ('agency_sale', 'partner_distribution') AND date >= ${startDate}::timestamp`;
+      
+      const totalStock = Number(totalStockRes[0].count);
+      const withPartners = Number(withPartnersRes[0].count);
+      const partnerDebt = partnersRes.reduce((sum, p) => sum + (Number(p.totalDebt) || 0), 0);
+      const salesPeriodCount = salesTx.reduce((sum, tx) => sum + (Number(tx.quantity) || 0), 0);
 
-      // 2. Sales in period
-      const { data: salesTx } = await supabase.from('transactions')
-        .select('quantity, cardIds')
-        .in('type', ['agency_sale', 'partner_distribution'])
-        .gte('date', startDate);
-
-      const salesPeriodCount = salesTx?.reduce((sum, tx) => sum + (tx.quantity || 0), 0) || 0;
-      const partnerDebt = partners?.reduce((sum, p) => sum + (Number(p.totalDebt) || 0), 0) || 0;
-
-      // 3. Net Profit in period
       let netProfit = 0;
-      if (salesTx && salesTx.length > 0) {
-        // Extract all card IDs sold in this period
+      if (salesTx.length > 0) {
         const allCardIds = salesTx.flatMap(tx => tx.cardIds || []);
         if (allCardIds.length > 0) {
-           // Fetch purchase and selling prices for these cards in chunks concurrently
-           const chunkSize = 1000;
-           const chunks = [];
-           for (let i = 0; i < allCardIds.length; i += chunkSize) {
-             chunks.push(allCardIds.slice(i, i + chunkSize));
-           }
-           
-           const results = await Promise.all(chunks.map(chunk => 
-             supabase.from('cards')
-               .select('purchasePrice, sellingPrice')
-               .in('id', chunk)
-           ));
-           
-           results.forEach(({ data: profitCards }) => {
-             netProfit += profitCards?.reduce((sum, c) => sum + (Number(c.sellingPrice) - Number(c.purchasePrice)), 0) || 0;
-           });
+           const profitCards = await sql`SELECT "purchasePrice", "sellingPrice" FROM cards WHERE id = ANY(${allCardIds}::int[])`;
+           netProfit += profitCards.reduce((sum, c) => sum + (Number(c.sellingPrice) - Number(c.purchasePrice)), 0);
         }
       }
 
       return { totalStock, withPartners, salesToday: salesPeriodCount, partnerDebt, netProfit };
     }
 
-    // --- Stock ---
     if (endpoint === '/stock' && method === 'GET') {
-      const { data } = await supabase.from('cards').select('value').eq('status', 'in_stock').eq('location', 'main_stock');
+      const data = await sql`SELECT value FROM cards WHERE status = 'in_stock' AND location = 'main_stock'`;
       const stockObj: Record<number, number> = {};
-      data?.forEach(card => {
-        stockObj[card.value] = (stockObj[card.value] || 0) + 1;
+      data.forEach(card => {
+        const val = Number(card.value);
+        stockObj[val] = (stockObj[val] || 0) + 1;
       });
       return stockObj;
     }
 
-    // --- Cards ---
     if (endpoint.startsWith('/cards?') && method === 'GET') {
       const urlParams = new URLSearchParams(endpoint.split('?')[1]);
       const status = urlParams.get('status');
@@ -90,39 +67,30 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
       const startDate = urlParams.get('startDate');
       const endDate = urlParams.get('endDate');
 
-      // 1. Auto-expire cards that are in_stock and past expiry date
-      const today = new Date().toISOString();
-      await supabase
-        .from('cards')
-        .update({ status: 'expired' })
-        .eq('status', 'in_stock')
-        .lt('expiryDate', today);
+      await sql`UPDATE cards SET status = 'expired' WHERE status = 'in_stock' AND "expiryDate" < NOW()`;
 
-      // 2. Build the query
-      let query = supabase.from('cards').select('*', { count: 'exact' });
-      if (status && status !== 'all') query = query.eq('status', status);
-      if (location && location !== 'all') query = query.eq('location', location);
-      if (search) query = query.ilike('cardNumber', `%${search}%`);
-      
-      if (startDate) {
-        query = query.gte('entryDate', new Date(startDate).toISOString());
-      }
+      let conditions = [];
+      let params: any[] = [];
+      let paramIdx = 1;
+
+      if (status && status !== 'all') { conditions.push(`status = $${paramIdx++}`); params.push(status); }
+      if (location && location !== 'all') { conditions.push(`location = $${paramIdx++}`); params.push(location); }
+      if (search) { conditions.push(`"cardNumber" ILIKE $${paramIdx++}`); params.push(`%${search}%`); }
+      if (startDate) { conditions.push(`"entryDate" >= $${paramIdx++}`); params.push(new Date(startDate).toISOString()); }
       if (endDate) {
-        // Set to end of day
-        const endDay = new Date(endDate);
-        endDay.setHours(23, 59, 59, 999);
-        query = query.lte('entryDate', endDay.toISOString());
+        const endDay = new Date(endDate); endDay.setHours(23, 59, 59, 999);
+        conditions.push(`"entryDate" <= $${paramIdx++}`); params.push(endDay.toISOString());
       }
 
-      const { data, count, error } = await query
-        .order('entryDate', { ascending: false })
-        .range((page - 1) * limit, page * limit - 1);
-
-      if (error) throw error;
-      return { data, total: count, page, totalPages: Math.ceil((count || 0) / limit) };
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      const countRes = await sql(`SELECT COUNT(*) as count FROM cards ${whereClause}`, params);
+      const total = Number(countRes[0].count);
+      
+      const data = await sql(`SELECT * FROM cards ${whereClause} ORDER BY "entryDate" DESC LIMIT $${paramIdx} OFFSET $${paramIdx+1}`, [...params, limit, (page - 1) * limit]);
+      
+      return { data, total, page, totalPages: Math.ceil(total / limit) };
     }
 
-    // --- Cards available for selection (by value, location) ---
     if (endpoint.startsWith('/cards/available') && method === 'GET') {
       const urlParams = new URLSearchParams(endpoint.split('?')[1]);
       const value = urlParams.get('value');
@@ -130,184 +98,141 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
       const agencyId = urlParams.get('agencyId');
       const partnerId = urlParams.get('partnerId');
 
-      let query = supabase
-        .from('cards')
-        .select('id, cardNumber, value, purchasePrice, sellingPrice, expiryDate')
-        .eq('status', 'in_stock')
-        .eq('location', location);
+      let conditions = [`status = 'in_stock'`, `location = $1`];
+      let params: any[] = [location];
+      let pIdx = 2;
 
-      if (value) query = query.eq('value', Number(value));
-      if (agencyId && location === 'agency') query = query.eq('agencyId', agencyId);
-      if (partnerId && location === 'partner') query = query.eq('partnerId', partnerId);
+      if (value) { conditions.push(`value = $${pIdx++}`); params.push(Number(value)); }
+      if (agencyId && location === 'agency') { conditions.push(`"agencyId" = $${pIdx++}`); params.push(Number(agencyId)); }
+      if (partnerId && location === 'partner') { conditions.push(`"partnerId" = $${pIdx++}`); params.push(Number(partnerId)); }
 
-      const { data, error } = await query.order('cardNumber', { ascending: true });
-      if (error) throw error;
+      const data = await sql(`SELECT id, "cardNumber", value, "purchasePrice", "sellingPrice", "expiryDate" FROM cards WHERE ${conditions.join(' AND ')} ORDER BY "cardNumber" ASC`, params);
       return data || [];
     }
 
     if (endpoint === '/cards/batch' && method === 'POST') {
       const { bankName, date, value, purchasePrice, quantity, startNumber, expiryDate } = body;
-      const cardsToInsert = [];
       const cleanStartNum = startNumber.replace(/\s+/g, '');
       let startNum;
+      try { startNum = BigInt(cleanStartNum); } catch (e) { throw new Error("Numéro de carte invalide"); }
       
-      try {
-        startNum = BigInt(cleanStartNum);
-      } catch (e) {
-        throw new Error("Numéro de carte invalide");
-      }
+      const insertedCardIds = [];
       
-      for (let i = 0; i < quantity; i++) {
-        const nextNum = (startNum + BigInt(i)).toString();
-        const paddedNum = nextNum.padStart(cleanStartNum.length, '0');
-        cardsToInsert.push({
-          cardNumber: paddedNum,
-          value,
-          entryDate: new Date(date).toISOString(),
-          expiryDate: new Date(expiryDate).toISOString(),
-          status: 'in_stock',
-          location: 'main_stock',
-          purchasePrice,
-          sellingPrice: 0,
-          bankName
-        });
-      }
+      const entryDateIso = new Date(date).toISOString();
+      const expiryDateIso = new Date(expiryDate).toISOString();
 
       const chunkSize = 1000;
-      const insertedCardIds = [];
-      for (let i = 0; i < cardsToInsert.length; i += chunkSize) {
-        const chunk = cardsToInsert.slice(i, i + chunkSize);
-        const { data: insertedChunk, error: cardsError } = await supabase.from('cards').insert(chunk).select('id');
-        if (cardsError) throw cardsError;
-        if (insertedChunk) insertedCardIds.push(...insertedChunk.map(c => c.id));
+      for (let i = 0; i < quantity; i += chunkSize) {
+        const chunkEnd = Math.min(i + chunkSize, quantity);
+        let insertValues = [];
+        let params = [];
+        let pIdx = 1;
+        
+        for (let j = i; j < chunkEnd; j++) {
+          const paddedNum = (startNum + BigInt(j)).toString().padStart(cleanStartNum.length, '0');
+          insertValues.push(`($${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, 'in_stock', 'main_stock', $${pIdx++}, 0, $${pIdx++})`);
+          params.push(paddedNum, value, entryDateIso, expiryDateIso, purchasePrice, bankName);
+        }
+
+        const insertedChunk = await sql(`INSERT INTO cards ("cardNumber", value, "entryDate", "expiryDate", status, location, "purchasePrice", "sellingPrice", "bankName") VALUES ${insertValues.join(', ')} RETURNING id`, params);
+        insertedCardIds.push(...insertedChunk.map(c => c.id));
       }
 
-      const { error: txError } = await supabase.from('transactions').insert({
-        type: 'bank_withdrawal',
-        date: new Date(date).toISOString(),
-        amount: purchasePrice * quantity,
-        quantity,
-        cardIds: insertedCardIds,
-        description: `Retrait banque ${bankName}`
-      });
-      if (txError) throw txError;
+      await sql`
+        INSERT INTO transactions (type, date, amount, quantity, "cardIds", description)
+        VALUES ('bank_withdrawal', ${entryDateIso}::timestamp, ${purchasePrice * quantity}, ${quantity}, ${insertedCardIds}::int[], ${`Retrait banque ${bankName}`})
+      `;
 
       return { success: true };
     }
 
     let m = match(/^\/cards\/(\d+)\/status$/);
     if (m && method === 'PATCH') {
-      const id = m[1];
+      const id = Number(m[1]);
       const { status, location } = body;
-      const updateData: any = { status };
-      if (location) {
-        updateData.location = location;
-        if (location === 'main_stock') {
-          updateData.agencyId = null;
-          updateData.partnerId = null;
-          updateData.sellingPrice = 0;
-        }
-      }
       
-      const { error } = await supabase.from('cards').update(updateData).eq('id', id);
-      if (error) throw error;
+      if (location === 'main_stock') {
+        await sql`UPDATE cards SET status = ${status}, location = ${location}, "agencyId" = NULL, "partnerId" = NULL, "sellingPrice" = 0 WHERE id = ${id}`;
+      } else if (location) {
+        await sql`UPDATE cards SET status = ${status}, location = ${location} WHERE id = ${id}`;
+      } else {
+        await sql`UPDATE cards SET status = ${status} WHERE id = ${id}`;
+      }
       return { success: true };
     }
 
     m = match(/^\/cards\/(\d+)$/);
     if (m && method === 'PATCH') {
-      const id = m[1];
+      const id = Number(m[1]);
       const { cardNumber, value, purchasePrice } = body;
-      const { error } = await supabase.from('cards').update({ cardNumber, value, purchasePrice }).eq('id', id);
-      if (error) throw error;
+      await sql`UPDATE cards SET "cardNumber" = ${cardNumber}, value = ${value}, "purchasePrice" = ${purchasePrice} WHERE id = ${id}`;
       return { success: true };
     }
 
     if (m && method === 'DELETE') {
-      const id = m[1];
-      const { error } = await supabase.from('cards').delete().eq('id', id);
-      if (error) throw error;
+      const id = Number(m[1]);
+      await sql`DELETE FROM cards WHERE id = ${id}`;
       return { success: true };
     }
 
     if (endpoint === '/cards/bulk-delete' && method === 'POST') {
       const { ids } = body;
-      const { error } = await supabase.from('cards').delete().in('id', ids);
-      if (error) throw error;
+      await sql`DELETE FROM cards WHERE id = ANY(${ids}::int[])`;
       return { success: true };
     }
 
     if (endpoint === '/cards/bulk-transfer-partner' && method === 'POST') {
       const { ids, partnerId, sellingPrice } = body;
-      await supabase.from('cards').update({ status: 'with_partner', location: 'partner', partnerId, sellingPrice }).in('id', ids);
+      await sql`UPDATE cards SET status = 'with_partner', location = 'partner', "partnerId" = ${partnerId}, "sellingPrice" = ${sellingPrice} WHERE id = ANY(${ids}::int[])`;
       const totalAmount = ids.length * sellingPrice;
-      await supabase.from('transactions').insert({
-        type: 'partner_distribution',
-        date: new Date().toISOString(),
-        amount: totalAmount,
-        quantity: ids.length,
-        partnerId,
-        cardIds: ids,
-        description: `Distribution de ${ids.length} cartes au partenaire`
-      });
+      await sql`
+        INSERT INTO transactions (type, date, amount, quantity, "partnerId", "cardIds", description)
+        VALUES ('partner_distribution', NOW(), ${totalAmount}, ${ids.length}, ${partnerId}, ${ids}::int[], ${`Distribution de ${ids.length} cartes au partenaire`})
+      `;
       return { success: true };
     }
 
     if (endpoint === '/cards/bulk-transfer-agency' && method === 'POST') {
       const { ids, agencyId } = body;
-      await supabase.from('cards').update({ location: 'agency', agencyId }).in('id', ids);
-      await supabase.from('transactions').insert({
-        type: 'agency_transfer',
-        date: new Date().toISOString(),
-        amount: 0,
-        quantity: ids.length,
-        cardIds: ids,
-        agencyId,
-        description: `Transfert de ${ids.length} cartes vers l'agence`
-      });
+      await sql`UPDATE cards SET location = 'agency', "agencyId" = ${agencyId} WHERE id = ANY(${ids}::int[])`;
+      await sql`
+        INSERT INTO transactions (type, date, amount, quantity, "agencyId", "cardIds", description)
+        VALUES ('agency_transfer', NOW(), 0, ${ids.length}, ${agencyId}, ${ids}::int[], ${`Transfert de ${ids.length} cartes vers l'agence`})
+      `;
       return { success: true };
     }
 
-    // --- Partners ---
     if (endpoint === '/partners' && method === 'GET') {
-      const { data, error } = await supabase.from('partners').select('*').order('createdAt', { ascending: false });
-      if (error) throw error;
-      return data;
+      return await sql`SELECT * FROM partners ORDER BY "createdAt" DESC`;
     }
 
     if (endpoint === '/partners' && method === 'POST') {
       const { name, phone } = body;
-      const { data, error } = await supabase.from('partners').insert({ name, phone }).select('id').single();
-      if (error) throw error;
-      return { id: data.id };
+      const data = await sql`INSERT INTO partners (name, phone) VALUES (${name}, ${phone || ''}) RETURNING id`;
+      return { id: data[0].id };
     }
 
     m = match(/^\/partners\/(\d+)\/distribute$/);
     if (m && method === 'POST') {
-      const partnerId = m[1];
+      const partnerId = Number(m[1]);
       const { cards, date } = body;
 
       let totalQuantity = 0;
       let totalAmount = 0;
-      let allDistributedCardIds: number[] = [];
+      let allDistributedCardIds = [];
 
       for (const item of cards) {
         const { value, quantity, sellingPrice } = item;
         if (quantity <= 0) continue;
 
-        const { data: availableCards } = await supabase.from('cards')
-          .select('id')
-          .eq('value', value)
-          .eq('location', 'main_stock')
-          .eq('status', 'in_stock')
-          .limit(quantity);
+        const availableCards = await sql`SELECT id FROM cards WHERE value = ${value} AND location = 'main_stock' AND status = 'in_stock' LIMIT ${quantity}`;
 
-        if (!availableCards || availableCards.length < quantity) {
-          throw new Error(`Stock principal insuffisant pour les cartes de ${value.toLocaleString()} GNF. Demandé: ${quantity}, Disponible: ${availableCards?.length || 0}`);
+        if (availableCards.length < quantity) {
+          throw new Error(`Stock principal insuffisant pour ${value.toLocaleString()} GNF. Demandé: ${quantity}, Dispo: ${availableCards.length}`);
         }
 
         const cardIds = availableCards.map(c => c.id);
-        await supabase.from('cards').update({ status: 'with_partner', location: 'partner', partnerId, sellingPrice }).in('id', cardIds);
+        await sql`UPDATE cards SET status = 'with_partner', location = 'partner', "partnerId" = ${partnerId}, "sellingPrice" = ${sellingPrice} WHERE id = ANY(${cardIds}::int[])`;
         
         allDistributedCardIds.push(...cardIds);
         totalQuantity += quantity;
@@ -315,31 +240,23 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
       }
 
       if (totalQuantity > 0) {
-        await supabase.from('transactions').insert({
-          type: 'partner_distribution',
-          date: new Date(date || new Date().toISOString()).toISOString(),
-          amount: totalAmount,
-          quantity: totalQuantity,
-          partnerId,
-          cardIds: allDistributedCardIds,
-          description: `Distribution de ${totalQuantity} cartes au partenaire`
-        });
+        await sql`
+          INSERT INTO transactions (type, date, amount, quantity, "partnerId", "cardIds", description)
+          VALUES ('partner_distribution', ${new Date(date || new Date()).toISOString()}::timestamp, ${totalAmount}, ${totalQuantity}, ${partnerId}, ${allDistributedCardIds}::int[], ${`Distribution de ${totalQuantity} cartes au partenaire`})
+        `;
       }
       return { success: true };
     }
 
-    // --- Distribute by specific card IDs (manual card selection) ---
     m = match(/^\/partners\/(\d+)\/distribute-selected$/);
     if (m && method === 'POST') {
-      const partnerId = m[1];
+      const partnerId = Number(m[1]);
       const { selectedCards, date } = body;
-      // selectedCards: Array of { cardId: number, sellingPrice: number }
       if (!selectedCards || selectedCards.length === 0) throw new Error('Aucune carte sélectionnée');
 
       const cardIds = selectedCards.map((c: any) => c.cardId);
       let totalAmount = 0;
 
-      // Update each card individually with its own selling price (or do in groups by price)
       const byPrice: Record<number, number[]> = {};
       for (const { cardId, sellingPrice } of selectedCards) {
         if (!byPrice[sellingPrice]) byPrice[sellingPrice] = [];
@@ -347,71 +264,46 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
         totalAmount += sellingPrice;
       }
       for (const [sellingPrice, ids] of Object.entries(byPrice)) {
-        await supabase.from('cards')
-          .update({ status: 'with_partner', location: 'partner', partnerId, sellingPrice: Number(sellingPrice) })
-          .in('id', ids);
+        await sql`UPDATE cards SET status = 'with_partner', location = 'partner', "partnerId" = ${partnerId}, "sellingPrice" = ${Number(sellingPrice)} WHERE id = ANY(${ids as number[]}::int[])`;
       }
 
-      await supabase.from('transactions').insert({
-        type: 'partner_distribution',
-        date: new Date(date || new Date().toISOString()).toISOString(),
-        amount: totalAmount,
-        quantity: cardIds.length,
-        partnerId,
-        cardIds,
-        description: `Distribution de ${cardIds.length} cartes au partenaire (sélection manuelle)`
-      });
+      await sql`
+        INSERT INTO transactions (type, date, amount, quantity, "partnerId", "cardIds", description)
+        VALUES ('partner_distribution', ${new Date(date || new Date()).toISOString()}::timestamp, ${totalAmount}, ${cardIds.length}, ${partnerId}, ${cardIds}::int[], ${`Distribution (manuelle) de ${cardIds.length} cartes`})
+      `;
       return { success: true };
     }
 
     m = match(/^\/partners\/(\d+)\/payment$/);
     if (m && method === 'POST') {
-      const partnerId = m[1];
+      const partnerId = Number(m[1]);
       const { amount, date } = body;
 
-      await supabase.from('transactions').insert({
-        type: 'partner_payment',
-        date: new Date(date).toISOString(),
-        amount,
-        quantity: 0,
-        partnerId,
-        description: 'Paiement reçu'
-      });
+      await sql`
+        INSERT INTO transactions (type, date, amount, quantity, "partnerId", description)
+        VALUES ('partner_payment', ${new Date(date).toISOString()}::timestamp, ${amount}, 0, ${partnerId}, 'Paiement reçu')
+      `;
       return { success: true };
     }
 
     m = match(/^\/partners\/(\d+)\/details$/);
     if (m && method === 'GET') {
-      const partnerId = m[1];
-      const { data: partner } = await supabase.from('partners').select('*').eq('id', partnerId).single();
-      const { data: currentCards } = await supabase.from('cards').select('*').eq('partnerId', partnerId).eq('status', 'with_partner');
-      const { data: transactions } = await supabase.from('transactions').select('*').eq('partnerId', partnerId).order('date', { ascending: false });
+      const partnerId = Number(m[1]);
+      const partnerData = await sql`SELECT * FROM partners WHERE id = ${partnerId}`;
+      const partner = partnerData[0];
+      const currentCards = await sql`SELECT * FROM cards WHERE "partnerId" = ${partnerId} AND status = 'with_partner'`;
+      const transactions = await sql`SELECT * FROM transactions WHERE "partnerId" = ${partnerId} ORDER BY date DESC`;
 
-      // Optimize: Fetch all cards for all transactions in one go concurrently
-      const allTxCardIds = (transactions || []).flatMap(tx => tx.cardIds || []);
+      const allTxCardIds = transactions.flatMap(tx => tx.cardIds || []);
       let allTxCards: any[] = [];
-      
       if (allTxCardIds.length > 0) {
-        const chunkSize = 1000;
-        const chunks = [];
-        for (let i = 0; i < allTxCardIds.length; i += chunkSize) {
-          chunks.push(allTxCardIds.slice(i, i + chunkSize));
-        }
-        
-        const results = await Promise.all(chunks.map(chunk => 
-          supabase.from('cards').select('id, cardNumber, value, sellingPrice').in('id', chunk)
-        ));
-        
-        results.forEach(({ data: cardsChunk }) => {
-          if (cardsChunk) allTxCards.push(...cardsChunk);
-        });
+        allTxCards = await sql`SELECT id, "cardNumber", value, "sellingPrice" FROM cards WHERE id = ANY(${allTxCardIds}::int[])`;
       }
-
+      
       const cardsMap = new Map(allTxCards.map(c => [c.id, c]));
-
-      const transactionsWithCards = (transactions || []).map(tx => {
+      const transactionsWithCards = transactions.map(tx => {
         if (tx.cardIds && tx.cardIds.length > 0) {
-          const cards = tx.cardIds.map((id: string) => cardsMap.get(id)).filter(Boolean);
+          const cards = tx.cardIds.map((id: number) => cardsMap.get(id)).filter(Boolean);
           return { ...tx, cards };
         }
         return { ...tx, cards: [] };
@@ -420,143 +312,100 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
       return { partner, currentCards, transactions: transactionsWithCards };
     }
 
-    // --- Delete Partner ---
-    m = match(/^\/partners\/(\d+)$/);;
+    m = match(/^\/partners\/(\d+)$/);
     if (m && method === 'DELETE') {
-      const partnerId = m[1];
-      // Return cards to main stock
-      await supabase.from('cards')
-        .update({ status: 'in_stock', location: 'main_stock', partnerId: null, sellingPrice: null })
-        .eq('partnerId', partnerId);
-      // Delete all partner transactions
-      await supabase.from('transactions').delete().eq('partnerId', partnerId);
-      // Delete partner
-      await supabase.from('partners').delete().eq('id', partnerId);
+      const partnerId = Number(m[1]);
+      await sql`UPDATE cards SET status = 'in_stock', location = 'main_stock', "partnerId" = NULL, "sellingPrice" = 0 WHERE "partnerId" = ${partnerId}`;
+      await sql`DELETE FROM transactions WHERE "partnerId" = ${partnerId}`;
+      await sql`DELETE FROM partners WHERE id = ${partnerId}`;
       return { success: true };
     }
 
-    // --- Agencies ---
     if (endpoint === '/agencies' && method === 'GET') {
-      const { data, error } = await supabase.from('agencies').select('*').order('createdAt', { ascending: false });
-      if (error) throw error;
-      return data;
+      return await sql`SELECT * FROM agencies ORDER BY "createdAt" DESC`;
     }
 
     if (endpoint === '/agencies' && method === 'POST') {
       const { name, address } = body;
-      const { data, error } = await supabase.from('agencies').insert({ name, address: address || '' }).select('id').single();
-      if (error) throw error;
-      return { id: data.id };
+      const data = await sql`INSERT INTO agencies (name, address) VALUES (${name}, ${address || ''}) RETURNING id`;
+      return { id: data[0].id };
     }
 
-    // --- Delete Agency ---
-    m = match(/^\/agencies\/(\d+)$/);;
+    m = match(/^\/agencies\/(\d+)$/);
     if (m && method === 'DELETE') {
-      const agencyId = m[1];
-      // Return cards to main stock
-      await supabase.from('cards')
-        .update({ status: 'in_stock', location: 'main_stock', agencyId: null })
-        .eq('agencyId', agencyId);
-      // Delete all agency transactions
-      await supabase.from('transactions').delete().eq('agencyId', agencyId);
-      // Delete agency
-      await supabase.from('agencies').delete().eq('id', agencyId);
+      const agencyId = Number(m[1]);
+      await sql`UPDATE cards SET status = 'in_stock', location = 'main_stock', "agencyId" = NULL WHERE "agencyId" = ${agencyId}`;
+      await sql`DELETE FROM transactions WHERE "agencyId" = ${agencyId}`;
+      await sql`DELETE FROM agencies WHERE id = ${agencyId}`;
       return { success: true };
     }
 
     if (endpoint === '/agencies/stock' && method === 'GET') {
-      const { data } = await supabase.from('cards')
-        .select('agencyId, value')
-        .eq('location', 'agency')
-        .eq('status', 'in_stock')
-        .not('agencyId', 'is', null);
-        
+      const data = await sql`SELECT "agencyId", value FROM cards WHERE location = 'agency' AND status = 'in_stock' AND "agencyId" IS NOT NULL`;
       const stocks: Record<string, Record<number, number>> = {};
-      
-      if (data) {
-        data.forEach(card => {
-          if (card.agencyId) {
-            if (!stocks[card.agencyId]) {
-              stocks[card.agencyId] = {};
-            }
-            stocks[card.agencyId][card.value] = (stocks[card.agencyId][card.value] || 0) + 1;
-          }
-        });
-      }
-      
+      data.forEach(card => {
+        const aId = String(card.agencyId);
+        if (!stocks[aId]) stocks[aId] = {};
+        stocks[aId][Number(card.value)] = (stocks[aId][Number(card.value)] || 0) + 1;
+      });
       return stocks;
     }
 
     m = match(/^\/agencies\/(\d+)\/stock$/);
     if (m && method === 'GET') {
-      const agencyId = m[1];
-      const { data } = await supabase.from('cards').select('value').eq('location', 'agency').eq('agencyId', agencyId).eq('status', 'in_stock');
+      const agencyId = Number(m[1]);
+      const data = await sql`SELECT value FROM cards WHERE location = 'agency' AND "agencyId" = ${agencyId} AND status = 'in_stock'`;
       const stockObj: Record<number, number> = {};
-      data?.forEach(card => {
-        stockObj[card.value] = (stockObj[card.value] || 0) + 1;
+      data.forEach(card => {
+        stockObj[Number(card.value)] = (stockObj[Number(card.value)] || 0) + 1;
       });
       return stockObj;
     }
 
     m = match(/^\/agencies\/(\d+)\/details$/);
     if (m && method === 'GET') {
-      const agencyId = m[1];
-      const [{ data: agency }, { data: currentCards }, { data: transactions }] = await Promise.all([
-        supabase.from('agencies').select('*').eq('id', agencyId).single(),
-        supabase.from('cards').select('*').eq('location', 'agency').eq('agencyId', agencyId).eq('status', 'in_stock'),
-        supabase.from('transactions').select('*').or(`agencyId.eq.${agencyId}`).in('type', ['agency_transfer', 'agency_sale']).order('date', { ascending: false })
-      ]);
+      const agencyId = Number(m[1]);
+      const agencyData = await sql`SELECT * FROM agencies WHERE id = ${agencyId}`;
+      const agency = agencyData[0];
+      const currentCards = await sql`SELECT * FROM cards WHERE location = 'agency' AND "agencyId" = ${agencyId} AND status = 'in_stock'`;
+      const transactions = await sql`SELECT * FROM transactions WHERE "agencyId" = ${agencyId} AND type IN ('agency_transfer', 'agency_sale') ORDER BY date DESC`;
 
-      // Enrich transactions with card details
-      const allTxCardIds = (transactions || []).flatMap((tx: any) => tx.cardIds || []);
+      const allTxCardIds = transactions.flatMap(tx => tx.cardIds || []);
       let allTxCards: any[] = [];
       if (allTxCardIds.length > 0) {
-        const chunkSize = 1000;
-        const chunks = [];
-        for (let i = 0; i < allTxCardIds.length; i += chunkSize) chunks.push(allTxCardIds.slice(i, i + chunkSize));
-        const results = await Promise.all(chunks.map((chunk: any[]) => supabase.from('cards').select('id, cardNumber, value, sellingPrice').in('id', chunk)));
-        results.forEach(({ data: cardsChunk }) => { if (cardsChunk) allTxCards.push(...cardsChunk); });
+        allTxCards = await sql`SELECT id, "cardNumber", value, "sellingPrice" FROM cards WHERE id = ANY(${allTxCardIds}::int[])`;
       }
-      const cardsMap = new Map(allTxCards.map((c: any) => [c.id, c]));
-      const transactionsWithCards = (transactions || []).map((tx: any) => ({
+      
+      const cardsMap = new Map(allTxCards.map(c => [c.id, c]));
+      const transactionsWithCards = transactions.map(tx => ({
         ...tx,
-        cards: (tx.cardIds || []).map((id: string) => cardsMap.get(id)).filter(Boolean)
+        cards: (tx.cardIds || []).map((id: number) => cardsMap.get(id)).filter(Boolean)
       }));
 
-      // Summary stats
-      const totalTransferred = (transactions || []).filter((t: any) => t.type === 'agency_transfer').reduce((sum: number, t: any) => sum + t.quantity, 0);
-      const totalSold = (transactions || []).filter((t: any) => t.type === 'agency_sale').reduce((sum: number, t: any) => sum + t.quantity, 0);
-      const totalRevenue = (transactions || []).filter((t: any) => t.type === 'agency_sale').reduce((sum: number, t: any) => sum + t.amount, 0);
+      const totalTransferred = transactions.filter(t => t.type === 'agency_transfer').reduce((sum, t) => sum + Number(t.quantity), 0);
+      const totalSold = transactions.filter(t => t.type === 'agency_sale').reduce((sum, t) => sum + Number(t.quantity), 0);
+      const totalRevenue = transactions.filter(t => t.type === 'agency_sale').reduce((sum, t) => sum + Number(t.amount), 0);
 
       return { agency, currentCards, transactions: transactionsWithCards, stats: { totalTransferred, totalSold, totalRevenue } };
     }
 
-    // --- Transfer by specific card IDs to agency (manual card selection) ---
     m = match(/^\/agencies\/(\d+)\/transfer-selected$/);
     if (m && method === 'POST') {
-      const agencyId = m[1];
+      const agencyId = Number(m[1]);
       const { cardIds } = body;
       if (!cardIds || cardIds.length === 0) throw new Error('Aucune carte sélectionnée');
 
-      await supabase.from('cards')
-        .update({ location: 'agency', agencyId })
-        .in('id', cardIds);
-
-      await supabase.from('transactions').insert({
-        type: 'agency_transfer',
-        date: new Date().toISOString(),
-        amount: 0,
-        quantity: cardIds.length,
-        cardIds,
-        agencyId,
-        description: `Transfert de ${cardIds.length} cartes vers l'agence (sélection manuelle)`
-      });
+      await sql`UPDATE cards SET location = 'agency', "agencyId" = ${agencyId} WHERE id = ANY(${cardIds}::int[])`;
+      await sql`
+        INSERT INTO transactions (type, date, amount, quantity, "cardIds", "agencyId", description)
+        VALUES ('agency_transfer', NOW(), 0, ${cardIds.length}, ${cardIds}::int[], ${agencyId}, ${`Transfert manuel de ${cardIds.length} cartes`})
+      `;
       return { success: true };
     }
 
     m = match(/^\/agencies\/(\d+)\/transfer$/);
     if (m && method === 'POST') {
-      const agencyId = m[1];
+      const agencyId = Number(m[1]);
       const { cards } = body;
 
       let totalQuantity = 0;
@@ -566,41 +415,28 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
         const { value, quantity } = item;
         if (quantity <= 0) continue;
 
-        const { data: availableCards } = await supabase.from('cards')
-          .select('id')
-          .eq('value', value)
-          .eq('location', 'main_stock')
-          .eq('status', 'in_stock')
-          .limit(quantity);
-
-        if (!availableCards || availableCards.length < quantity) {
-          throw new Error(`Stock insuffisant pour les cartes de ${value.toLocaleString()} GNF. Demandé: ${quantity}, Disponible: ${availableCards?.length || 0}`);
-        }
+        const availableCards = await sql`SELECT id FROM cards WHERE value = ${value} AND location = 'main_stock' AND status = 'in_stock' LIMIT ${quantity}`;
+        if (availableCards.length < quantity) throw new Error(`Stock insuffisant pour ${value.toLocaleString()}`);
 
         const cardIds = availableCards.map(c => c.id);
-        await supabase.from('cards').update({ location: 'agency', agencyId }).in('id', cardIds);
+        await sql`UPDATE cards SET location = 'agency', "agencyId" = ${agencyId} WHERE id = ANY(${cardIds}::int[])`;
         
         allTransferredCardIds.push(...cardIds);
         totalQuantity += quantity;
       }
 
       if (totalQuantity > 0) {
-        await supabase.from('transactions').insert({
-          type: 'agency_transfer',
-          date: new Date().toISOString(),
-          amount: 0,
-          quantity: totalQuantity,
-          cardIds: allTransferredCardIds,
-          description: `Transfert vers Agence: ${totalQuantity} cartes`,
-          agencyId
-        });
+        await sql`
+          INSERT INTO transactions (type, date, amount, quantity, "cardIds", description, "agencyId")
+          VALUES ('agency_transfer', NOW(), 0, ${totalQuantity}, ${allTransferredCardIds}::int[], ${`Transfert vers Agence: ${totalQuantity} cartes`}, ${agencyId})
+        `;
       }
       return { success: true };
     }
 
     m = match(/^\/agencies\/(\d+)\/sale$/);
     if (m && method === 'POST') {
-      const agencyId = m[1];
+      const agencyId = Number(m[1]);
       const { cards } = body;
 
       let totalQuantity = 0;
@@ -611,20 +447,11 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
         const { value, quantity, sellingPrice } = item;
         if (quantity <= 0) continue;
 
-        const { data: availableCards } = await supabase.from('cards')
-          .select('id')
-          .eq('value', value)
-          .eq('location', 'agency')
-          .eq('agencyId', agencyId)
-          .eq('status', 'in_stock')
-          .limit(quantity);
-
-        if (!availableCards || availableCards.length < quantity) {
-          throw new Error(`Stock insuffisant pour les cartes de ${value}$ dans l'agence. Demandé: ${quantity}, Disponible: ${availableCards?.length || 0}`);
-        }
+        const availableCards = await sql`SELECT id FROM cards WHERE value = ${value} AND location = 'agency' AND "agencyId" = ${agencyId} AND status = 'in_stock' LIMIT ${quantity}`;
+        if (availableCards.length < quantity) throw new Error(`Stock agence insuffisant`);
 
         const cardIds = availableCards.map(c => c.id);
-        await supabase.from('cards').update({ status: 'sold', sellingPrice }).in('id', cardIds);
+        await sql`UPDATE cards SET status = 'sold', "sellingPrice" = ${sellingPrice} WHERE id = ANY(${cardIds}::int[])`;
         
         allSoldCardIds.push(...cardIds);
         totalQuantity += quantity;
@@ -632,54 +459,45 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
       }
 
       if (totalQuantity > 0) {
-        await supabase.from('transactions').insert({
-          type: 'agency_sale',
-          date: new Date().toISOString(),
-          amount: totalAmount,
-          quantity: totalQuantity,
-          cardIds: allSoldCardIds,
-          description: `Vente Agence: ${totalQuantity} cartes`,
-          agencyId
-        });
+        await sql`
+          INSERT INTO transactions (type, date, amount, quantity, "cardIds", description, "agencyId")
+          VALUES ('agency_sale', NOW(), ${totalAmount}, ${totalQuantity}, ${allSoldCardIds}::int[], ${`Vente Agence: ${totalQuantity} cartes`}, ${agencyId})
+        `;
       }
       return { success: true };
     }
 
-    // --- Transactions ---
     if (endpoint.startsWith('/transactions') && method === 'GET') {
-      const urlParams = new URLSearchParams(endpoint.split('?')[1]);
+      const urlParams = newSearchParams(endpoint.split('?')[1]);
       const period = urlParams.get('period') || 'all';
       
-      let query = supabase.from('transactions').select('*').order('date', { ascending: false });
+      let conditions = [];
+      let params: any[] = [];
       
       if (period !== 'all') {
         let startDate = new Date(0).toISOString();
         const now = new Date();
-        if (period === '24h') {
-          startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-        } else if (period === '7d') {
-          startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
-        } else if (period === '30d') {
-          startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
-        } else if (period === '3m') {
-          startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString();
-        }
-        query = query.gte('date', startDate);
-      } else {
-        query = query.limit(500); // Limit to 500 for 'all' to prevent massive payloads
+        if (period === '24h') startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+        else if (period === '7d') startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        else if (period === '30d') startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        else if (period === '3m') startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString();
+        
+        conditions.push(`date >= $1`);
+        params.push(startDate);
       }
-
-      const { data, error } = await query;
-      if (error) throw error;
+      
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : 'LIMIT 500';
+      const queryStr = `SELECT * FROM transactions ${whereClause} ORDER BY date DESC`;
+      
+      const data = await sql(queryStr, params);
       return data;
     }
 
-    // --- System ---
     if (endpoint === '/system/reset' && method === 'POST') {
-      await supabase.from('transactions').delete().not('id', 'is', null);
-      await supabase.from('cards').delete().not('id', 'is', null);
-      await supabase.from('partners').delete().not('id', 'is', null);
-      await supabase.from('agencies').delete().not('id', 'is', null);
+      await sql`DELETE FROM transactions`;
+      await sql`DELETE FROM cards`;
+      await sql`DELETE FROM partners`;
+      await sql`DELETE FROM agencies`;
       return { success: true };
     }
 
@@ -688,4 +506,9 @@ export async function fetchApi(endpoint: string, options?: RequestInit) {
     console.error('API Error:', error);
     throw new Error(error.message || 'Unknown error');
   }
+}
+
+// polyfill search params if missing in environments
+function newSearchParams(str: string) {
+  return new URLSearchParams(str);
 }

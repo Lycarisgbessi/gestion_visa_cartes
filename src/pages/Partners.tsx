@@ -4,7 +4,7 @@ import AddPartnerModal from '../components/AddPartnerModal';
 import DistributeCardsModal from '../components/DistributeCardsModal';
 import PaymentModal from '../components/PaymentModal';
 import PartnerDetailsModal from '../components/PartnerDetailsModal';
-import { supabase } from '../lib/supabase';
+// import { supabase } from '../lib/supabase';
 import { Phone, User, Info, Eye, Trash2, AlertTriangle } from 'lucide-react';
 import { fetchApi } from '../lib/api';
 
@@ -33,11 +33,11 @@ export default function Partners() {
 
   useEffect(() => {
     loadPartners();
-    const partnersSub = supabase
-      .channel('partners_changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'partners' }, () => loadPartners())
-      .subscribe();
-    return () => { supabase.removeChannel(partnersSub); };
+    const intervalId = setInterval(() => {
+      loadPartners();
+    }, 10000);
+
+    return () => clearInterval(intervalId);
   }, []);
 
   const handleDistribute = (partner: Partner) => { setSelectedPartner(partner); setIsDistributeModalOpen(true); };

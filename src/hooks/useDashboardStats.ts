@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
 import { fetchApi } from '../lib/api';
-import { supabase } from '../lib/supabase';
 
 export function useDashboardStats(period: string = 'all') {
   const [stats, setStats] = useState({
@@ -26,24 +25,12 @@ export function useDashboardStats(period: string = 'all') {
   useEffect(() => {
     loadStats();
 
-    // Set up real-time subscription
-    const cardsSubscription = supabase
-      .channel('public:cards')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'cards' }, () => {
-        loadStats();
-      })
-      .subscribe();
-
-    const transactionsSubscription = supabase
-      .channel('public:transactions')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions' }, () => {
-        loadStats();
-      })
-      .subscribe();
+    const intervalId = setInterval(() => {
+      loadStats();
+    }, 10000); // Poll every 10 seconds
 
     return () => {
-      supabase.removeChannel(cardsSubscription);
-      supabase.removeChannel(transactionsSubscription);
+      clearInterval(intervalId);
     };
   }, [period]);
 

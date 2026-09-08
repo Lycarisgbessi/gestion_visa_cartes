@@ -6,7 +6,7 @@ import AgencySaleModal from '../components/AgencySaleModal';
 import AgencyDetailsModal from '../components/AgencyDetailsModal';
 import { Store, ShoppingCart, Info, ArrowRightLeft, Eye, Trash2, AlertTriangle } from 'lucide-react';
 import { fetchApi } from '../lib/api';
-import { supabase } from '../lib/supabase';
+// import { supabase } from '../lib/supabase';
 
 export default function Agency() {
   const [agencies, setAgencies] = useState<AgencyType[]>([]);
@@ -35,15 +35,11 @@ export default function Agency() {
 
   useEffect(() => {
     loadAgencies();
-    const agenciesSub = supabase
-      .channel('agencies_changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'agencies' }, () => loadAgencies())
-      .subscribe();
-    const cardsSub = supabase
-      .channel('agencies_cards_changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'cards' }, () => loadAgencies())
-      .subscribe();
-    return () => { supabase.removeChannel(agenciesSub); supabase.removeChannel(cardsSub); };
+    const intervalId = setInterval(() => {
+      loadAgencies();
+    }, 10000);
+
+    return () => clearInterval(intervalId);
   }, []);
 
   const handleTransfer = (agency: AgencyType) => { setSelectedAgency(agency); setIsTransferModalOpen(true); };

@@ -4,7 +4,7 @@ import AddCardModal from '../components/AddCardModal';
 import EditCardModal from '../components/EditCardModal';
 import { Search, Filter, Download, Edit2, Trash2, CheckSquare, Square, X, ArrowRight, AlertTriangle } from 'lucide-react';
 import { fetchApi } from '../lib/api';
-import { supabase } from '../lib/supabase';
+// import { supabase } from '../lib/supabase';
 
 export default function Inventory() {
   const [cards, setCards] = useState<Card[]>([]);
@@ -54,11 +54,11 @@ export default function Inventory() {
   useEffect(() => {
     loadCards();
     loadPartnersAndAgencies();
-    const subscription = supabase
-      .channel('inventory_changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'cards' }, () => loadCards())
-      .subscribe();
-    return () => { supabase.removeChannel(subscription); };
+    const intervalId = setInterval(() => {
+      loadCards();
+    }, 10000);
+
+    return () => clearInterval(intervalId);
   }, [statusFilter, searchTerm, startDate, endDate, page]);
 
   const toggleSelect = (id: string) => {
